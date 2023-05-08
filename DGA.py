@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 from itertools import islice
+import time
+import argparse
 
 
 # Custom dataset class for extracting one-hot-encoded dna sequences
@@ -18,7 +20,7 @@ class GenomeData(Dataset):
 		# NOTE: AGAT can be used to add introns (agat_sp_add_introns.pl --gff [] --out [])
 		# NOTE: The gff should also be reduced to a single transcripts (agat_sp_keep_longest_isoform.pl -gff [] -o [])
 		self.fasta_path = fasta_path
-		self.gff_path = gff_path
+		self.gff = pd.read_csv(gff_path, sep="\t", usecols=[0,2,3,4], names=["chr","feature", "start","end"], comment="#")
 		self.window = window
 		self.class_map = {
 			"CDS": 0,
@@ -31,10 +33,9 @@ class GenomeData(Dataset):
 		
 		self.total_length = 0
 		self.chr_lengths = [0]
-		with open(fasta_path) as fa:
-			for record in SeqIO.parse(fa, 'fasta'):
-				self.chr_lengths.append(len(record) + self.total_length)
-				self.total_length += len(record)
+		for record in SeqIO.parse(fasta_path, "fasta"):
+			self.chr_lengths.append(len(record) + self.total_length)
+			self.total_length += len(record)
 
 	def __len__(self):
 		return self.total_length - self.window
@@ -42,30 +43,27 @@ class GenomeData(Dataset):
 	def __getitem__(self, idx):
 		# Get the chromosome sequence corresponding to the index
 		# Then update the index to chromosome coordinates
-		print(f"Loading from {idx}")
 		seqs = SeqIO.parse(self.fasta_path, "fasta")
 		chr_bool = [idx < chr_idx for chr_idx in self.chr_lengths]
 		for i in range(1,len(chr_bool)):
 			if chr_bool[i] and not chr_bool[i-1]:
 				record = next(islice(seqs, i-1, None))
-				idx -= sum(self.chr_lengths[:i-1])
+				idx -= self.chr_lengths[i-1]
 				if idx + self.window > len(record):
-					idx -= (idx + self.window) - len(record)
+					idx = len(record) - self.window
 				break
 		
 		# Extract the sequence from the chromosome according to the
 		# index and the window length
 		# Then convert to a one-hot-encoded tensor
-		print(f"One-Hot encoding...")
 		end_idx = idx+self.window
 		seq_map = [self.seq_map[i] for i in record[idx:end_idx].seq]
 		sequence_onehot = torch.Tensor(np.eye(15)[seq_map])
 
 		# Extract the base-wise classes for the sequence from the gff
-		print("Extracting base-wise classes")
 		feature_list = ('five_prime_UTR','CDS','intron','three_prime_UTR')
 		chromosome = record.id.split(" ")[0]
-		gff = (pd.read_csv(self.gff_path, sep="\t", usecols=[0,2,3,4], names=["chr","feature", "start","end"], comment="#")[lambda x: x["chr"] == chromosome])
+		gff = self.gff.loc[self.gff["chr"] == chromosome]
 		gff = gff.loc[gff["feature"].isin(feature_list)]
 		gff.loc[gff["start"] > gff["end"], ('start','end')] = (gff.loc[gff["start"] > gff["end"], ('start','end')].values)
 		
@@ -76,9 +74,8 @@ class GenomeData(Dataset):
 			feat = gff.loc[((gff["start"] <= coord_map[i]) & (gff["end"] >= coord_map[i]))].reset_index(drop=True)
 			if len(feat) != 0:
 				class_map[i] = self.class_map[feat.loc[0,"feature"]]
-		print("Done.")
 		
-		classes = torch.Tensor(class_map)
+		classes = torch.Tensor(class_map).type(torch.LongTensor)
 		return sequence_onehot, classes
 
 class biLSTM(nn.Module):
@@ -107,32 +104,41 @@ class biLSTM(nn.Module):
 		#c_init = Variable(torch.zeros(2*self.num_layers, self.hidden_size, 1)) # Internal state
 		out, _ = self.lstm(sequence) # LSTM with input, hidden, and internal state
 		out = self.fc(out)
-		out = F.log_softmax(out, dim=1)
 		return out
 	
-def trainBiLSTM(model, data_loader, num_epochs, learning_rate):
-	objective = torch.nn.NLLLoss()
+def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
+
+	objective = torch.nn.CrossEntropyLoss()
 	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 	
+	epochstart = time.time()
 	for epoch in range(num_epochs):
 		loss_trn = 0.0
+		i = 0
 		for sequence, labels in data_loader:
-			print("Forward pass...")
+			if device.type == "cpu":
+				sequence = sequence.permute(1,0,2)
+			else:
+				sequence = sequence.permute(1,0,2).cuda()
+				labels = labels.cuda()
+
+			batchstart = time.time()
 			outputs = model(sequence) # Forward pass	
-			print("Computing loss")
-			loss = objective(outputs, labels.long()) # Compute loss
-		
+			loss = objective(outputs.permute(1,2,0), labels) # Compute loss
 			optimizer.zero_grad() # Reset gradients 
-			print("Computing gradients")
 			loss.backward() # Compute gradients
 			optimizer.step() # Update parameters via backpropagation
+			batchend = time.time()
 			loss_trn += loss.item()
+			i += 1
+			print(f"Epoch {epoch}, Batch {i} complete. {batchend - batchstart}")
 
 		#if (epoch == 0) | (epoch % 10 == 0):
-		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}")
+		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}")
+		torch.save(model.state_dict(), "lstm_state.pt")
 
 def testBiLSTM(model, data_loader):
-	
+	#model.eval()
 	pred_stats = {
 		0:{"total":0, "correct":0, "class":"CDS"},
 		1:{"total":0, "correct":0, "class":"Intron"},
@@ -153,6 +159,23 @@ def testBiLSTM(model, data_loader):
 		if predicted[i].item() == labels[i].item():
 			pred_stats[labels[i].item()]["correct"] += 1
 
+def trainModel(fasta, gff, window=20, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True):
+	torch.manual_seed(seed)
+	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+	train_dat = GenomeData(fasta, gff, window)
+	trainLoader = DataLoader(train_dat,
+				batch_size=batch_size, 
+				drop_last=False, 
+				num_workers=num_workers, 
+				pin_memory=pin_memory,
+				shuffle = True)
+	
+	lstm_model = biLSTM(hidden, layers, outfile).to(device)
+	print(f"Beginning training on {device}")
+	trainBiLSTM(lstm_model, trainLoader, 10, 0.1, device, outfile)
+
+
 # NOTE: Split fasta and gff file into train and test sets
 # seqkit grep -n -v -r -p "Chr4" Athaliana_167_TAIR10.fa > Ath_Train.fa
 # seqkit grep -n -r -p "Chr4" Athaliana_167_TAIR10.fa > Ath_Test.fa
@@ -160,27 +183,26 @@ def testBiLSTM(model, data_loader):
 # grep "Chr4" Athaliana_167_gene_exons_introns_longest.gff3 > Ath_Test.gff
 
 if __name__ == '__main__':
-	torch.manual_seed(1)
-	batch_size = 3
-	num_workers = 1
-	pin_memory = False
+	ap = argparse.ArgumentParser()
+	ap.add_argument('action', type=str, required=True, help="[train|] : Action to take")
+	ap.add_argument("fasta", type=str, required=True, help="Fasta file")
+	ap.add_argument('gff', type=str, required=True, help="Gff file")
+	ap.add_argument('--window', default=20, type=int, help="Window size for lstm")
+	ap.add_argument('--hidden', default=10, type=int, help='Number of hidden units for lstm')
+	ap.add_argument('--layers', default=1, type=int, help='Number of lstm layers')
+	ap.add_argument('--outfile', default="model_state.pt", type=str, help="File to save model sate to")
+	ap.add_argument('--batchsize', default=1, type=int, help="Batch size for data loader")
+	ap.add_argument('--seed', default=123, type=int, help="Random seed for torch")
+	ap.add_argument('--workers', default=0, type=int, help="Number of subprocesses for data loading")
 
-	train_dat = GenomeData("Ath_Train.fa", "Ath_Train.gff", 20)
-	trainLoader = DataLoader(train_dat,
-				batch_size=batch_size, 
-				drop_last=False, 
-				num_workers=num_workers, 
-				pin_memory=pin_memory,
-				shuffle = True)
-
-	test_dat = GenomeData("Ath_Test.fa", "Ath_Test.gff", 20000)
-	testLoader = DataLoader(train_dat,
-				batch_size=batch_size, 
-				drop_last=False, 
-				num_workers=num_workers, 
-				pin_memory=pin_memory,
-				shuffle = True)
-
-	lstm_model = biLSTM(20, 1)
-	trainBiLSTM(lstm_model, trainLoader, 100, 0.01)
-	testBiLSTM(lstm_model, test_dat)
+	if ap.action == 'train':
+		trainModel(ap.fasta, 
+			ap.gff, 
+			window=ap.window, 
+			hidden=ap.hidden, 
+			layers=ap.layers, 
+			outfile=ap.outfile,
+			batch_size=ap.batchsize, 
+			seed=ap.seed, 
+			num_workers=ap.workers, 
+			pin_memory=True)
