@@ -10,7 +10,7 @@ from torch.autograd import Variable
 from itertools import islice
 import time
 import argparse
-
+import sys
 
 # Custom dataset class for extracting one-hot-encoded dna sequences
 # and basewise classes
@@ -105,7 +105,7 @@ class biLSTM(nn.Module):
 		out, _ = self.lstm(sequence) # LSTM with input, hidden, and internal state
 		out = self.fc(out)
 		return out
-	
+
 def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 
 	objective = torch.nn.CrossEntropyLoss()
@@ -131,10 +131,11 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 			batchend = time.time()
 			loss_trn += loss.item()
 			i += 1
-			print(f"Epoch {epoch}, Batch {i} complete. {batchend - batchstart}")
+			if (i == 1) | (epoch % 10 == 0):
+				print(f"Epoch {epoch}, Batch {i}, loss {loss.item()}. {batchend - batchstart}", file=sys.stderr)
 
 		#if (epoch == 0) | (epoch % 10 == 0):
-		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}")
+		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
 		torch.save(model.state_dict(), "lstm_state.pt")
 
 def testBiLSTM(model, data_loader):
@@ -159,10 +160,10 @@ def testBiLSTM(model, data_loader):
 		if predicted[i].item() == labels[i].item():
 			pred_stats[labels[i].item()]["correct"] += 1
 
-def trainModel(fasta, gff, window=20, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True):
+def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True, world_size=4):
 	torch.manual_seed(seed)
 	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+	
 	train_dat = GenomeData(fasta, gff, window)
 	trainLoader = DataLoader(train_dat,
 				batch_size=batch_size, 
@@ -171,9 +172,20 @@ def trainModel(fasta, gff, window=20, hidden=10, layers=1, outfile="model_state.
 				pin_memory=pin_memory,
 				shuffle = True)
 	
-	lstm_model = biLSTM(hidden, layers, outfile).to(device)
-	print(f"Beginning training on {device}")
-	trainBiLSTM(lstm_model, trainLoader, 10, 0.1, device, outfile)
+	if lstm_model:
+		lstm_model.load_state_dict(torch.load("lstm_state.pt")) # needs map_location...
+	else:
+		lstm_model = biLSTM(hidden, layers)
+	
+	if torch.cuda.device_count() > 1:
+		torch.distributed.init_process_group(backend='nccl', world_size=world_size)
+		lstm_model = nn.parallel.DistributedDataParallel(lstm_model.to(device))
+	else:
+		torch.distributed.init_process_group(backend='gloo', world_size=world_size)
+		lstm_model = nn.parallel.DistributedDataParallel(lstm_model)
+
+	print(f"Beginning training on {device}, with {torch.cuda.device_count()} gpus.")
+	trainBiLSTM(lstm_model, trainLoader, epochs, lr, device, outfile)
 
 
 # NOTE: Split fasta and gff file into train and test sets
@@ -184,9 +196,9 @@ def trainModel(fasta, gff, window=20, hidden=10, layers=1, outfile="model_state.
 
 if __name__ == '__main__':
 	ap = argparse.ArgumentParser()
-	ap.add_argument('action', type=str, required=True, help="[train|] : Action to take")
-	ap.add_argument("fasta", type=str, required=True, help="Fasta file")
-	ap.add_argument('gff', type=str, required=True, help="Gff file")
+	ap.add_argument('action', type=str, help="[train|] : Action to take")
+	ap.add_argument("fasta", type=str, help="Fasta file")
+	ap.add_argument('gff', type=str, help="Gff file")
 	ap.add_argument('--window', default=20, type=int, help="Window size for lstm")
 	ap.add_argument('--hidden', default=10, type=int, help='Number of hidden units for lstm')
 	ap.add_argument('--layers', default=1, type=int, help='Number of lstm layers')
@@ -194,15 +206,24 @@ if __name__ == '__main__':
 	ap.add_argument('--batchsize', default=1, type=int, help="Batch size for data loader")
 	ap.add_argument('--seed', default=123, type=int, help="Random seed for torch")
 	ap.add_argument('--workers', default=0, type=int, help="Number of subprocesses for data loading")
+	ap.add_argument('--model', default=None ,type=str, help="GPU model state to resume training on")
+	ap.add_argument('--lr', default=0.1, type=float, help="Learning rate")
+	ap.add_argument('--epochs', default=100, type=int, help="Number of training epochs")
+	ap.add_argument('--worldsize', default=4, type=int, help="Number of parallel training processes")
+	args = ap.parse_args()
 
-	if ap.action == 'train':
-		trainModel(ap.fasta, 
-			ap.gff, 
-			window=ap.window, 
-			hidden=ap.hidden, 
-			layers=ap.layers, 
-			outfile=ap.outfile,
-			batch_size=ap.batchsize, 
-			seed=ap.seed, 
-			num_workers=ap.workers, 
-			pin_memory=True)
+	if args.action == 'train':
+		trainModel(args.fasta, 
+			args.gff, 
+			window=args.window, 
+			hidden=args.hidden, 
+			layers=args.layers, 
+			outfile=args.outfile,
+			batch_size=args.batchsize, 
+			seed=args.seed, 
+			num_workers=args.workers, 
+			pin_memory=True,
+			lr=args.lr,
+			epochs=args.epochs,
+			lstm_model=args.model,
+			world_size=args.worldsize)

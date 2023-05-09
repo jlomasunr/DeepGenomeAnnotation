@@ -22,5 +22,6 @@ conda install -c bioconda -c pytorch pytorch biopython numpy pandas
 ## Training
 
 ```
-sbatch train_bilstm.out
+conda activate bilstm
+sbatch train_bilstm.sh
 ```
