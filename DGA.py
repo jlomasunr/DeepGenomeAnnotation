@@ -1,16 +1,14 @@
+import sys, os, time, argparse, torch
 from Bio import SeqIO
 import numpy as np
 import pandas as pd
-import torch 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, distributed
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 from itertools import islice
-import time
-import argparse
-import sys
+from socket import gethostname
 
 # Custom dataset class for extracting one-hot-encoded dna sequences
 # and basewise classes
@@ -108,21 +106,18 @@ class biLSTM(nn.Module):
 
 def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 
-	objective = torch.nn.CrossEntropyLoss()
-	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+	objective = nn.CrossEntropyLoss()
+	optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 	
 	epochstart = time.time()
 	for epoch in range(num_epochs):
 		loss_trn = 0.0
 		i = 0
 		for sequence, labels in data_loader:
-			if device.type == "cpu":
-				sequence = sequence.permute(1,0,2)
-			else:
-				sequence = sequence.permute(1,0,2).cuda()
-				labels = labels.cuda()
-
 			batchstart = time.time()
+			sequence = sequence.permute(1,0,2).to(device)
+			labels = labels.to(device)
+			
 			outputs = model(sequence) # Forward pass	
 			loss = objective(outputs.permute(1,2,0), labels) # Compute loss
 			optimizer.zero_grad() # Reset gradients 
@@ -136,7 +131,7 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 
 		#if (epoch == 0) | (epoch % 10 == 0):
 		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
-		torch.save(model.state_dict(), "lstm_state.pt")
+		torch.save(model.state_dict(), outfile)
 
 def testBiLSTM(model, data_loader):
 	#model.eval()
@@ -160,32 +155,48 @@ def testBiLSTM(model, data_loader):
 		if predicted[i].item() == labels[i].item():
 			pred_stats[labels[i].item()]["correct"] += 1
 
-def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True, world_size=4):
+def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True):
 	torch.manual_seed(seed)
 	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 	
 	train_dat = GenomeData(fasta, gff, window)
-	trainLoader = DataLoader(train_dat,
-				batch_size=batch_size, 
-				drop_last=False, 
-				num_workers=num_workers, 
-				pin_memory=pin_memory,
-				shuffle = True)
+	trainSampler = distributed.DistributedSampler(train_dat, num_replicas=world_size, rank=rank)
 	
 	if lstm_model:
 		lstm_model.load_state_dict(torch.load("lstm_state.pt")) # needs map_location...
 	else:
 		lstm_model = biLSTM(hidden, layers)
 	
-	if torch.cuda.device_count() > 1:
-		torch.distributed.init_process_group(backend='nccl', world_size=world_size)
-		lstm_model = nn.parallel.DistributedDataParallel(lstm_model.to(device))
+	if torch.cuda.device_count() >= 1:
+		torch.distributed.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+		local_rank = rank - gpus_per_node * (rank // gpus_per_node)
+		torch.cuda.set_device(local_rank)
+		lstm_model = nn.parallel.DistributedDataParallel(lstm_model.to(local_rank), 
+							device_ids=[local_rank],
+							gradient_as_bucket_view=True)
+		trainLoader  = DataLoader(train_dat, 
+						batch_size=batch_size, 
+						sampler=trainSampler,
+						num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]), 
+						pin_memory=pin_memory)
 	else:
-		torch.distributed.init_process_group(backend='gloo', world_size=world_size)
-		lstm_model = nn.parallel.DistributedDataParallel(lstm_model)
+		workers = int(os.environ["WORKERS"])
+		torch.distributed.init_process_group(backend='gloo', rank=rank, world_size=world_size)
+		local_rank = rank - (cpus_per_node - workers) * (rank // (cpus_per_node - workers))
+		torch.device(local_rank)
+		lstm_model = nn.parallel.DistributedDataParallel(lstm_model.to(local_rank),
+							device_ids=[local_rank],
+							gradient_as_bucket_view=True)
+		trainLoader  = DataLoader(train_dat, 
+						batch_size=batch_size, 
+						sampler=trainSampler,
+						num_workers=workers, 
+						pin_memory=pin_memory)
 
 	print(f"Beginning training on {device}, with {torch.cuda.device_count()} gpus.")
-	trainBiLSTM(lstm_model, trainLoader, epochs, lr, device, outfile)
+	trainBiLSTM(lstm_model, trainLoader, epochs, lr, local_rank, outfile)
+	
+	torch.distributed.destroy_process_group()
 
 
 # NOTE: Split fasta and gff file into train and test sets
@@ -209,10 +220,18 @@ if __name__ == '__main__':
 	ap.add_argument('--model', default=None ,type=str, help="GPU model state to resume training on")
 	ap.add_argument('--lr', default=0.1, type=float, help="Learning rate")
 	ap.add_argument('--epochs', default=100, type=int, help="Number of training epochs")
-	ap.add_argument('--worldsize', default=4, type=int, help="Number of parallel training processes")
 	args = ap.parse_args()
 
 	if args.action == 'train':
+
+		rank          = int(os.environ["SLURM_PROCID"])
+		world_size    = int(os.environ["WORLD_SIZE"])
+		gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
+		assert gpus_per_node == torch.cuda.device_count()
+		cpus_per_node = int(os.environ["SLURM_CPUS_ON_NODE"])
+		print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
+			  f" {gpus_per_node} allocated GPUs per node and {cpus_per_node} CPUs per node.", flush=True)
+
 		trainModel(args.fasta, 
 			args.gff, 
 			window=args.window, 
@@ -225,5 +244,4 @@ if __name__ == '__main__':
 			pin_memory=True,
 			lr=args.lr,
 			epochs=args.epochs,
-			lstm_model=args.model,
-			world_size=args.worldsize)
+			lstm_model=args.model)
