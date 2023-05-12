@@ -10,8 +10,7 @@ from torch.autograd import Variable
 from itertools import islice
 from socket import gethostname
 
-# Custom dataset class for extracting one-hot-encoded dna sequences
-# and basewise classes
+# Custom dataset class for extracting one-hot-encoded dna sequences and basewise classes
 class GenomeData(Dataset):
 	def __init__(self, fasta_path, class_path, window):
 		# Expects the gff to contain at least the following features ('gene','five_prime_UTR','CDS','intron','three_prime_UTR')
@@ -128,27 +127,31 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 			print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
 			torch.save(model.state_dict(), outfile) #model.model.state_dict()?
 
-def testBiLSTM(model, data_loader):
-	#model.eval()
+def testBiLSTM(model, seq, labels):
+	model.eval()
 	pred_stats = {
-		0:{"total":0, "correct":0, "class":"CDS"},
-		1:{"total":0, "correct":0, "class":"Intron"},
-		2:{"total":0, "correct":0, "class":"UTR"},
-		3:{"total":0, "correct":0, "class":"Intergenic"},
+		"Overall":{"total":0, "correct":0, "percent":0},
+		0:{"class":"CDS", "total":0, "correct":0, "percent":0},
+		1:{"class":"Intron", "total":0, "correct":0, "percent":0},
+		2:{"class":"UTR","total":0, "correct":0, "percent":0},
+		3:{"class":"Intergenic","total":0, "correct":0, "percent":0 },
 	}
 
-	total = 0
-	correct = 0
 	with torch.no_grad():
-		for sequence, labels in data_loader:
-			outputs = model(sequence)
-			_, predicted = torch.max(outputs, dim=1)
-			total += labels.shape[0]
-			correct += int((predicted == labels).sum())
-		for i in range(len(labels.tolist())):
-			pred_stats[labels[i].item()]["total"] += 1
+		outputs = model(seq)
+		_, predicted = torch.max(outputs, dim=1)
+		pred_stats["Overall"]["total"] = labels.size()[0]
+		pred_stats["Overall"]["correct"] = int((predicted == labels).sum())
+		pred_stats["Overall"]["percent"] = (pred_stats["Overall"]["correct"]/pred_stats["Overall"]["total"])*100
+	for i in range(len(labels)):
+		pred_stats[labels[i].item()]["total"] += 1
 		if predicted[i].item() == labels[i].item():
 			pred_stats[labels[i].item()]["correct"] += 1
+	
+	for i in range(4):
+		pred_stats[i]["percent"] = (pred_stats[i]["correct"]/pred_stats[i]["total"])*100
+	
+	return(pred_stats)
 
 def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True):
 	torch.manual_seed(seed)
@@ -193,18 +196,11 @@ def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidde
 	
 	torch.distributed.destroy_process_group()
 
-
-# NOTE: Split fasta and gff file into train and test sets
-# seqkit grep -n -v -r -p "Chr4" Athaliana_167_TAIR10.fa > Ath_Train.fa
-# seqkit grep -n -r -p "Chr4" Athaliana_167_TAIR10.fa > Ath_Test.fa
-# grep -v "Chr4" Athaliana_167_gene_exons_introns_longest.gff3 > Ath_Train.gff
-# grep "Chr4" Athaliana_167_gene_exons_introns_longest.gff3 > Ath_Test.gff
-
 if __name__ == '__main__':
 	ap = argparse.ArgumentParser()
-	ap.add_argument('action', type=str, help="[train|] : Action to take")
+	ap.add_argument('action', type=str, help="[train|test] : Action to take")
 	ap.add_argument("fasta", type=str, help="Fasta file")
-	ap.add_argument('gff', type=str, help="Gff file")
+	ap.add_argument('labels', type=str, help="Labels fasta file")
 	ap.add_argument('--window', default=20, type=int, help="Window size for lstm")
 	ap.add_argument('--hidden', default=10, type=int, help='Number of hidden units for lstm')
 	ap.add_argument('--layers', default=1, type=int, help='Number of lstm layers')
@@ -212,7 +208,7 @@ if __name__ == '__main__':
 	ap.add_argument('--batchsize', default=1, type=int, help="Batch size for data loader")
 	ap.add_argument('--seed', default=123, type=int, help="Random seed for torch")
 	ap.add_argument('--workers', default=0, type=int, help="Number of subprocesses for data loading")
-	ap.add_argument('--model', default=None ,type=str, help="GPU model state to resume training on")
+	ap.add_argument('--model', default=None ,type=str, help="Model state_dict")
 	ap.add_argument('--lr', default=0.1, type=float, help="Learning rate")
 	ap.add_argument('--epochs', default=100, type=int, help="Number of training epochs")
 	ap.add_argument('--nocuda', action='store_true', help="CPU only")
@@ -235,7 +231,7 @@ if __name__ == '__main__':
                           f" {cpus_per_node} CPUs per node.", flush=True)
 		
 		trainModel(args.fasta, 
-			args.gff, 
+			args.labels, 
 			window=args.window, 
 			hidden=args.hidden, 
 			layers=args.layers, 
@@ -247,3 +243,13 @@ if __name__ == '__main__':
 			lr=args.lr,
 			epochs=args.epochs,
 			lstm_model=args.model)
+
+if args.action == 'test':
+	# Requires: fasta, labels, --hidden, --layers, --model, --window
+	lstm_model = lstm_model = biLSTM(args.hidden, args.layers)
+	lstm_model.load_state_dict(torch.load(args.model))
+
+	test_dat = GenomeData(args.fasta, args.labels, args.window)
+	(seq, labels) = test_dat.__getitem__(0)
+	test = testBiLSTM(lstm_model, seq, labels)
+	print(test)
