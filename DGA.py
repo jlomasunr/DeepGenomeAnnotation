@@ -13,13 +13,13 @@ from socket import gethostname
 # Custom dataset class for extracting one-hot-encoded dna sequences
 # and basewise classes
 class GenomeData(Dataset):
-	def __init__(self, fasta_path, gff_path, window):
+	def __init__(self, fasta_path, class_path, window):
 		# Expects the gff to contain at least the following features ('gene','five_prime_UTR','CDS','intron','three_prime_UTR')
 		# NOTE: AGAT can be used to add introns (agat_sp_add_introns.pl --gff [] --out [])
 		# NOTE: The gff should also be reduced to a single transcripts (agat_sp_keep_longest_isoform.pl -gff [] -o [])
 		self.fasta_path = fasta_path
-		self.gff = pd.read_csv(gff_path, sep="\t", usecols=[0,2,3,4], names=["chr","feature", "start","end"], comment="#")
-		self.window = window
+		self.class_path = class_path
+		self.feature_list = ('five_prime_UTR','CDS','intron','three_prime_UTR')
 		self.class_map = {
 			"CDS": 0,
 			"intron": 1,
@@ -27,6 +27,8 @@ class GenomeData(Dataset):
 			"three_prime_UTR": 2,
 			"intergenic": 3
 			}
+		
+		self.window = window
 		self.seq_map = dict(zip("ACGTRYSWKMBDHVN", range(15)))
 		
 		self.total_length = 0
@@ -34,6 +36,7 @@ class GenomeData(Dataset):
 		for record in SeqIO.parse(fasta_path, "fasta"):
 			self.chr_lengths.append(len(record) + self.total_length)
 			self.total_length += len(record)
+		del record
 
 	def __len__(self):
 		return self.total_length - self.window
@@ -42,39 +45,30 @@ class GenomeData(Dataset):
 		# Get the chromosome sequence corresponding to the index
 		# Then update the index to chromosome coordinates
 		seqs = SeqIO.parse(self.fasta_path, "fasta")
+		clss = SeqIO.parse(self.class_path, "fasta")
 		chr_bool = [idx < chr_idx for chr_idx in self.chr_lengths]
 		for i in range(1,len(chr_bool)):
 			if chr_bool[i] and not chr_bool[i-1]:
-				record = next(islice(seqs, i-1, None))
+				seq_record = next(islice(seqs, i-1, None))
+				cls_record = next(islice(clss, i-1, None))
 				idx -= self.chr_lengths[i-1]
-				if idx + self.window > len(record):
-					idx = len(record) - self.window
+				if idx + self.window > len(seq_record):
+					idx = len(seq_record) - self.window
 				break
+		del seqs
+		del clss
 		
-		# Extract the sequence from the chromosome according to the
-		# index and the window length
-		# Then convert to a one-hot-encoded tensor
+		# Extract the dna and class sequences from the chromosome according to the
+		# index and the window length. Then convert to a one-hot-encoded tensor
 		end_idx = idx+self.window
-		seq_map = [self.seq_map[i] for i in record[idx:end_idx].seq]
-		sequence_onehot = torch.Tensor(np.eye(15)[seq_map])
-
-		# Extract the base-wise classes for the sequence from the gff
-		feature_list = ('five_prime_UTR','CDS','intron','three_prime_UTR')
-		chromosome = record.id.split(" ")[0]
-		gff = self.gff.loc[self.gff["chr"] == chromosome]
-		gff = gff.loc[gff["feature"].isin(feature_list)]
-		gff.loc[gff["start"] > gff["end"], ('start','end')] = (gff.loc[gff["start"] > gff["end"], ('start','end')].values)
+		sequence_onehot = torch.Tensor(np.eye(15)[[self.seq_map[i] for i in seq_record[idx+1:end_idx+1].seq]])
+		class_seq = cls_record[idx+1:end_idx+1].seq
+		classes = torch.Tensor(torch.tensor([int(i) for i in class_seq])).type(torch.LongTensor)
+		del seq_record
+		del cls_record
 		
-		#Start with everything 'intergenic' and then update each base
-		class_map = [3 for _ in range(len(seq_map))]
-		coord_map = [i for i in range(idx, end_idx)]
-		for i in range(len(class_map)):
-			feat = gff.loc[((gff["start"] <= coord_map[i]) & (gff["end"] >= coord_map[i]))].reset_index(drop=True)
-			if len(feat) != 0:
-				class_map[i] = self.class_map[feat.loc[0,"feature"]]
-		
-		classes = torch.Tensor(class_map).type(torch.LongTensor)
 		return sequence_onehot, classes
+
 
 class biLSTM(nn.Module):
 	def __init__(self, hidden_size, num_layers, dropout=0.2):
@@ -126,12 +120,13 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 			batchend = time.time()
 			loss_trn += loss.item()
 			i += 1
-			if (i == 1) | (epoch % 10 == 0):
+			if (i == 1) | (i % 100 == 0):
 				print(f"Epoch {epoch}, Batch {i}, loss {loss.item()}. {batchend - batchstart}", file=sys.stderr)
 
 		#if (epoch == 0) | (epoch % 10 == 0):
-		print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
-		torch.save(model.state_dict(), outfile)
+		if rank == 0:
+			print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
+			torch.save(model.state_dict(), outfile) #model.model.state_dict()?
 
 def testBiLSTM(model, data_loader):
 	#model.eval()
@@ -179,22 +174,22 @@ def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidde
 						sampler=trainSampler,
 						num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]), 
 						pin_memory=pin_memory)
+		
+		print(f"Beginning training on cuda {local_rank}.")
+		trainBiLSTM(lstm_model, trainLoader, epochs, lr, local_rank, outfile)
 	else:
-		workers = int(os.environ["WORKERS"])
 		torch.distributed.init_process_group(backend='gloo', rank=rank, world_size=world_size)
-		local_rank = rank - (cpus_per_node - workers) * (rank // (cpus_per_node - workers))
+		local_rank = rank - cpus_per_node * (rank // cpus_per_node)
 		torch.device(local_rank)
-		lstm_model = nn.parallel.DistributedDataParallel(lstm_model.to(local_rank),
-							device_ids=[local_rank],
-							gradient_as_bucket_view=True)
+		lstm_ddp = nn.parallel.DistributedDataParallel(lstm_model, device_ids=None, output_device=None, gradient_as_bucket_view=True)
 		trainLoader  = DataLoader(train_dat, 
 						batch_size=batch_size, 
 						sampler=trainSampler,
-						num_workers=workers, 
+						num_workers=num_workers, 
 						pin_memory=pin_memory)
 
-	print(f"Beginning training on {device}, with {torch.cuda.device_count()} gpus.")
-	trainBiLSTM(lstm_model, trainLoader, epochs, lr, local_rank, outfile)
+		print(f"Beginning training on {device} with rank {rank}.")
+		trainBiLSTM(lstm_ddp, trainLoader, epochs, lr, device, outfile)
 	
 	torch.distributed.destroy_process_group()
 
@@ -220,18 +215,25 @@ if __name__ == '__main__':
 	ap.add_argument('--model', default=None ,type=str, help="GPU model state to resume training on")
 	ap.add_argument('--lr', default=0.1, type=float, help="Learning rate")
 	ap.add_argument('--epochs', default=100, type=int, help="Number of training epochs")
+	ap.add_argument('--nocuda', action='store_true', help="CPU only")
 	args = ap.parse_args()
 
 	if args.action == 'train':
 
 		rank          = int(os.environ["SLURM_PROCID"])
 		world_size    = int(os.environ["WORLD_SIZE"])
-		gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
-		assert gpus_per_node == torch.cuda.device_count()
 		cpus_per_node = int(os.environ["SLURM_CPUS_ON_NODE"])
-		print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
-			  f" {gpus_per_node} allocated GPUs per node and {cpus_per_node} CPUs per node.", flush=True)
+		
 
+		if not args.nocuda:
+			gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
+			assert gpus_per_node == torch.cuda.device_count()
+			print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
+			  f" {gpus_per_node} allocated GPUs per node and {cpus_per_node} CPUs per node.", flush=True)
+		else:
+			print(f"Hello from rank {rank} of {world_size} on {gethostname()} where there are" \
+                          f" {cpus_per_node} CPUs per node.", flush=True)
+		
 		trainModel(args.fasta, 
 			args.gff, 
 			window=args.window, 
