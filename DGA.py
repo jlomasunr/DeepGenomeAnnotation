@@ -107,7 +107,6 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 		loss_trn = 0.0
 		i = 0
 		for sequence, labels in data_loader:
-			batchstart = time.time()
 			sequence = sequence.permute(1,0,2).to(device)
 			labels = labels.to(device)
 			
@@ -116,16 +115,13 @@ def trainBiLSTM(model, data_loader, num_epochs, learning_rate, device, outfile):
 			optimizer.zero_grad() # Reset gradients 
 			loss.backward() # Compute gradients
 			optimizer.step() # Update parameters via backpropagation
-			batchend = time.time()
 			loss_trn += loss.item()
 			i += 1
-			if (i == 1) | (i % 100 == 0):
-				print(f"Epoch {epoch}, Batch {i}, loss {loss.item()}. {batchend - batchstart}", file=sys.stderr)
 
 		#if (epoch == 0) | (epoch % 10 == 0):
 		if rank == 0:
 			print(f"Epoch: {epoch}, loss: {loss_trn/len(data_loader)}... {time.time() - epochstart}", file=sys.stderr)
-			torch.save(model.state_dict(), outfile) #model.model.state_dict()?
+			torch.save(model.module.state_dict(), outfile) 
 
 def testBiLSTM(model, seq, labels):
 	model.eval()
@@ -151,7 +147,7 @@ def testBiLSTM(model, seq, labels):
 	for i in range(4):
 		pred_stats[i]["percent"] = (pred_stats[i]["correct"]/pred_stats[i]["total"])*100
 	
-	return(pred_stats)
+	return pred_stats 
 
 def trainModel(fasta, gff, lstm_model=None, window=20, lr=0.1, epochs=100, hidden=10, layers=1, outfile="model_state.pt",batch_size=1, seed=123, num_workers=0, pin_memory=True):
 	torch.manual_seed(seed)
@@ -244,12 +240,12 @@ if __name__ == '__main__':
 			epochs=args.epochs,
 			lstm_model=args.model)
 
-if args.action == 'test':
-	# Requires: fasta, labels, --hidden, --layers, --model, --window
-	lstm_model = lstm_model = biLSTM(args.hidden, args.layers)
-	lstm_model.load_state_dict(torch.load(args.model))
+	if args.action == 'test':
+		# Requires: fasta, labels, --hidden, --layers, --model, --window
+		lstm_model = biLSTM(args.hidden, args.layers)
+		lstm_model.load_state_dict(torch.load(args.model))
 
-	test_dat = GenomeData(args.fasta, args.labels, args.window)
-	(seq, labels) = test_dat.__getitem__(0)
-	test = testBiLSTM(lstm_model, seq, labels)
-	print(test)
+		test_dat = GenomeData(args.fasta, args.labels, args.window)
+		(seq, labels) = test_dat.__getitem__(0)
+		test = testBiLSTM(lstm_model, seq, labels)
+		print(test)

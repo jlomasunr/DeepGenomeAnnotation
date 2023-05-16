@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_bilstm_cpu     # create a short name for your job
-#SBATCH --nodes=3                       # node count
-#SBATCH --ntasks-per-node=15             # total number of tasks per node
+#SBATCH --nodes=2                       # node count
+#SBATCH --ntasks-per-node=13             # total number of tasks per node
 #SBATCH --cpus-per-task=4               # cpu-cores per task (>1 if multi-threaded tasks)
 #SBATCH --mem=208G                       # total memory per node (4 GB per cpu-core is default)
 #SBATCH --time=14-00:00:0               # total run time limit
@@ -21,13 +21,13 @@ master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_ADDR=$master_addr
 echo "MASTER_ADDR="$MASTER_ADDR
 
-srun python DGA.py train Ath_Test.fa BaseWiseClasses.fa \
+srun python DGA.py train Train_Seq_Small.fa Train_Cls_Small.fa \
     --window 20 \
     --hidden 20 \
-    --layers 2 \
+    --layers 4 \
     --batchsize 64 \
     --workers 0 \
-    --lr 0.1 \
+    --lr 0.01 \
     --outfile model_state.pt \
-    --epochs 100 \
+    --epochs 500 \
     --nocuda
